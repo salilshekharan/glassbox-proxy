@@ -37,6 +37,22 @@ if [ "$GLASSBOX_ATLAS_ENABLED" = "true" ]; then
   fi
 fi
 
+# The built-in managed data plane enrolls itself with Atlas. Remote proxies
+# receive an administrator-provisioned token instead. The token is never put
+# on a command line or image layer.
+if [ -z "${GLASSBOX_PROXY_CONTROL_TOKEN:-}" ] && [ -n "${GLASSBOX_CONTROL_BOOTSTRAP_URL:-}" ]; then
+  GLASSBOX_PROXY_CONTROL_TOKEN="$(python - "$GLASSBOX_CONTROL_BOOTSTRAP_URL" "$atlas_key" <<'PY'
+import json, sys
+from urllib import request
+url, api_key = sys.argv[1:]
+req = request.Request(url, data=b"", method="POST", headers={"X-API-Key": api_key, "Accept": "application/json"})
+with request.urlopen(req, timeout=5) as response:
+    print(json.load(response)["bootstrap_token"])
+PY
+  )"
+  export GLASSBOX_PROXY_CONTROL_TOKEN
+fi
+
 mkdir -p "$HOME/.mitmproxy"
 chown -R glassbox:glassbox "$HOME"
 
@@ -64,7 +80,7 @@ exec gosu glassbox "$@" \
   --set "glassbox_atlas_inspection_mode=$GLASSBOX_ATLAS_INSPECTION_MODE" \
   --set "glassbox_atlas_fail_mode=$GLASSBOX_ATLAS_FAIL_MODE" \
   --set "glassbox_atlas_source=$GLASSBOX_ATLAS_SOURCE" \
-  --set "glassbox_atlas_profile=$GLASSBOX_ATLAS_PROFILE"
+  --set "glassbox_atlas_profile=$GLASSBOX_ATLAS_PROFILE" \
   --set "glassbox_control_config_url=${GLASSBOX_CONTROL_CONFIG_URL:-}" \
   --set "glassbox_control_token_env=$GLASSBOX_CONTROL_TOKEN_ENV" \
   --set "glassbox_control_poll_seconds=$GLASSBOX_CONTROL_POLL_SECONDS"
