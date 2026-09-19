@@ -155,7 +155,10 @@ class GlassBoxAtlasAddon:
         local_request_id = str(uuid.uuid4())
         try:
             decision = await self._inspection_client().inspect(self._payload(flow))
-        except AtlasClientError:
+        # The enforcement point must not leak an unexpected client/transport
+        # exception into the proxy runtime. The configured fail mode owns every
+        # inability to obtain a decision, including future transport adapters.
+        except Exception:
             if ctx.options.glassbox_atlas_fail_mode == "closed":
                 self._block(flow, request_id=local_request_id, service_unavailable=True)
             return

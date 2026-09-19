@@ -61,7 +61,7 @@ async def test_blocks_with_atlas_correlation_id() -> None:
 
 @pytest.mark.asyncio
 async def test_fails_closed_when_atlas_is_unavailable() -> None:
-    addon = GlassBoxAtlasAddon(StubClient(AtlasClientError("unavailable")))
+    addon = GlassBoxAtlasAddon(StubClient(RuntimeError("unavailable")))
     with taddons.context(addon) as tctx:
         tctx.configure(addon, glassbox_atlas_enabled=True, glassbox_atlas_endpoint="https://atlas.test/inspect")
         flow = tflow.tflow()
