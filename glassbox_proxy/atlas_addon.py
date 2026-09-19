@@ -16,6 +16,7 @@ import json
 import os
 import time
 import uuid
+from collections import deque
 from collections.abc import Mapping
 from typing import Any
 from typing import NamedTuple
@@ -102,6 +103,13 @@ class GlassBoxAtlasAddon:
         self._enforcement_mode = "enforce"
         self._control_version = 0
         self._control_checked_at = 0.0
+        self._telemetry_checked_at = 0.0
+        self._telemetry_task: asyncio.Task[None] | None = None
+        self._forwarded = 0
+        self._blocked = 0
+        self._would_block = 0
+        self._policy_errors = 0
+        self._latencies_ms: deque[float] = deque(maxlen=256)
 
     def load(self, loader: Any) -> None:
         loader.add_option(
@@ -158,6 +166,8 @@ class GlassBoxAtlasAddon:
         loader.add_option(name="glassbox_control_config_url", typespec=str, default="", help="Atlas signed proxy-control configuration endpoint.")
         loader.add_option(name="glassbox_control_token_env", typespec=str, default="GLASSBOX_PROXY_CONTROL_TOKEN", help="Environment variable containing the per-proxy control token.")
         loader.add_option(name="glassbox_control_poll_seconds", typespec=str, default="5", help="Signed control configuration polling interval in seconds.")
+        loader.add_option(name="glassbox_control_telemetry_url", typespec=str, default="", help="Atlas authenticated proxy telemetry endpoint.")
+        loader.add_option(name="glassbox_control_telemetry_seconds", typespec=str, default="5", help="Minimum telemetry publish interval in seconds.")
 
     def configure(self, updates: set[str]) -> None:
         if not {
@@ -224,9 +234,11 @@ class GlassBoxAtlasAddon:
         await self._enforce(flow, self._payload(flow))
 
     async def _enforce(self, flow: http.HTTPFlow, payload: Mapping[str, Any]) -> None:
+        started_at = time.monotonic()
         await self._refresh_control_mode()
         if self._enforcement_mode == "bypass":
             flow.metadata["glassbox_atlas_mode"] = "bypass"
+            self._record_telemetry("forwarded", started_at)
             return
         local_request_id = str(uuid.uuid4())
         try:
@@ -235,14 +247,92 @@ class GlassBoxAtlasAddon:
         # exception into the proxy runtime. The configured fail mode owns every
         # inability to obtain a decision, including future transport adapters.
         except Exception:
+            self._record_telemetry("policy_error", started_at)
             if ctx.options.glassbox_atlas_fail_mode == "closed":
                 self._block(flow, request_id=local_request_id, service_unavailable=True)
+                self._record_telemetry("blocked", started_at)
+            else:
+                self._record_telemetry("forwarded", started_at)
             return
 
         if decision.action in _BLOCKING_ACTIONS and self._enforcement_mode == "enforce":
             self._block(flow, request_id=decision.request_id, service_unavailable=False)
+            self._record_telemetry("blocked", started_at)
         elif decision.action in _BLOCKING_ACTIONS:
             flow.metadata["glassbox_atlas_would_block"] = True
+            self._record_telemetry("would_block", started_at)
+            self._record_telemetry("forwarded", started_at)
+        else:
+            self._record_telemetry("forwarded", started_at)
+
+    def _record_telemetry(self, outcome: str, started_at: float) -> None:
+        """Record real enforcement outcomes without retaining request content."""
+        if outcome == "forwarded":
+            self._forwarded += 1
+        elif outcome == "blocked":
+            self._blocked += 1
+        elif outcome == "would_block":
+            self._would_block += 1
+        elif outcome == "policy_error":
+            self._policy_errors += 1
+        self._latencies_ms.append((time.monotonic() - started_at) * 1_000)
+        self._schedule_telemetry_publish()
+
+    def _schedule_telemetry_publish(self) -> None:
+        url = ctx.options.glassbox_control_telemetry_url
+        if not url or self._telemetry_task is not None and not self._telemetry_task.done():
+            return
+        try:
+            interval = float(ctx.options.glassbox_control_telemetry_seconds)
+        except (TypeError, ValueError):
+            return
+        if interval <= 0 or time.monotonic() - self._telemetry_checked_at < interval:
+            return
+        self._telemetry_task = asyncio.create_task(self._publish_telemetry(url))
+
+    async def _publish_telemetry(self, url: str) -> None:
+        """Best-effort, authenticated telemetry; it can never delay egress."""
+        self._telemetry_checked_at = time.monotonic()
+        token = os.getenv(ctx.options.glassbox_control_token_env)
+        if not token:
+            return
+        try:
+            await asyncio.to_thread(self._post_telemetry, url, token, self._telemetry_payload())
+        except Exception:
+            # Retain counters in memory. The next bounded publish carries the
+            # latest cumulative values when Atlas becomes reachable again.
+            return
+
+    def _telemetry_payload(self) -> dict[str, Any]:
+        samples = sorted(self._latencies_ms)
+        # Nearest-rank percentile: with four observed requests, p95 is the
+        # slowest sample rather than the third sample.
+        p95 = samples[max(0, (len(samples) * 95 + 99) // 100 - 1)] if samples else None
+        return {
+            "version": self._control_version,
+            "mode": self._enforcement_mode,
+            "forwarded": self._forwarded,
+            "blocked": self._blocked,
+            "would_block": self._would_block,
+            "policy_errors": self._policy_errors,
+            "p95_latency_ms": p95,
+        }
+
+    @staticmethod
+    def _post_telemetry(url: str, token: str, payload: Mapping[str, Any]) -> None:
+        telemetry_request = request.Request(
+            url,
+            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-GlassBox-Proxy-Token": token,
+            },
+            method="POST",
+        )
+        with request.urlopen(telemetry_request, timeout=2.0) as response:
+            if response.status != 204:
+                raise AtlasClientError(f"Atlas telemetry returned HTTP {response.status}")
 
     async def _refresh_control_mode(self) -> None:
         """Accept only an HMAC-authenticated, monotonically-versioned Atlas mode."""

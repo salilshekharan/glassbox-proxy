@@ -147,3 +147,24 @@ async def test_metadata_only_does_not_inspect_decrypted_https_request() -> None:
         await addon.request(flow)
 
     assert client.payload is None
+
+
+def test_telemetry_payload_contains_only_cumulative_enforcement_metrics() -> None:
+    addon = GlassBoxAtlasAddon()
+    addon._control_version = 4
+    addon._enforcement_mode = "monitor"
+    addon._forwarded = 7
+    addon._blocked = 2
+    addon._would_block = 3
+    addon._policy_errors = 1
+    addon._latencies_ms.extend([1.0, 5.0, 10.0, 40.0])
+
+    assert addon._telemetry_payload() == {
+        "version": 4,
+        "mode": "monitor",
+        "forwarded": 7,
+        "blocked": 2,
+        "would_block": 3,
+        "policy_errors": 1,
+        "p95_latency_ms": 40.0,
+    }

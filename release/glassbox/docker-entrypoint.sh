@@ -18,6 +18,7 @@ fi
 : "${GLASSBOX_ATLAS_API_KEY_ENV:=GLASSBOX_ATLAS_API_KEY}"
 : "${GLASSBOX_CONTROL_TOKEN_ENV:=GLASSBOX_PROXY_CONTROL_TOKEN}"
 : "${GLASSBOX_CONTROL_POLL_SECONDS:=5}"
+: "${GLASSBOX_CONTROL_TELEMETRY_SECONDS:=5}"
 : "${GLASSBOX_PROXY_LISTEN_HOST:=0.0.0.0}"
 : "${GLASSBOX_PROXY_LISTEN_PORT:=8080}"
 
@@ -83,4 +84,6 @@ exec gosu glassbox "$@" \
   --set "glassbox_atlas_profile=$GLASSBOX_ATLAS_PROFILE" \
   --set "glassbox_control_config_url=${GLASSBOX_CONTROL_CONFIG_URL:-}" \
   --set "glassbox_control_token_env=$GLASSBOX_CONTROL_TOKEN_ENV" \
-  --set "glassbox_control_poll_seconds=$GLASSBOX_CONTROL_POLL_SECONDS"
+  --set "glassbox_control_poll_seconds=$GLASSBOX_CONTROL_POLL_SECONDS" \
+  --set "glassbox_control_telemetry_url=${GLASSBOX_CONTROL_TELEMETRY_URL:-}" \
+  --set "glassbox_control_telemetry_seconds=$GLASSBOX_CONTROL_TELEMETRY_SECONDS"
