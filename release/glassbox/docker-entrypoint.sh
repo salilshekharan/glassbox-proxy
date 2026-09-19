@@ -15,9 +15,7 @@ fi
 : "${GLASSBOX_ATLAS_INSPECTION_MODE:=metadata_only}"
 : "${GLASSBOX_ATLAS_PROFILE:=quick}"
 : "${GLASSBOX_ATLAS_SOURCE:=glassbox-proxy}"
-: "${GLASSBOX_ATLAS_API_KEY_ENV:=GLASSBOX_ATLAS_API_KEY}"
 : "${GLASSBOX_CONTROL_TOKEN_ENV:=GLASSBOX_PROXY_CONTROL_TOKEN}"
-: "${GLASSBOX_CONTROL_POLL_SECONDS:=5}"
 : "${GLASSBOX_CONTROL_TELEMETRY_SECONDS:=5}"
 : "${GLASSBOX_PROXY_LISTEN_HOST:=0.0.0.0}"
 : "${GLASSBOX_PROXY_LISTEN_PORT:=8080}"
@@ -27,22 +25,17 @@ if [ "$GLASSBOX_ATLAS_ENABLED" = "true" ]; then
     echo "GLASSBOX_ATLAS_ENDPOINT is required when GlassBox Atlas enforcement is enabled" >&2
     exit 64
   fi
-  if ! printf '%s' "$GLASSBOX_ATLAS_API_KEY_ENV" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$'; then
-    echo "GLASSBOX_ATLAS_API_KEY_ENV must be a valid environment variable name" >&2
-    exit 64
-  fi
-  atlas_key="$(printenv "$GLASSBOX_ATLAS_API_KEY_ENV" || true)"
-  if [ -z "${atlas_key:-}" ]; then
-    echo "Atlas API key environment variable is not set: $GLASSBOX_ATLAS_API_KEY_ENV" >&2
-    exit 64
-  fi
 fi
 
 # The built-in managed data plane enrolls itself with Atlas. Remote proxies
 # receive an administrator-provisioned token instead. The token is never put
 # on a command line or image layer.
 if [ -z "${GLASSBOX_PROXY_CONTROL_TOKEN:-}" ] && [ -n "${GLASSBOX_CONTROL_BOOTSTRAP_URL:-}" ]; then
-  GLASSBOX_PROXY_CONTROL_TOKEN="$(python - "$GLASSBOX_CONTROL_BOOTSTRAP_URL" "$atlas_key" <<'PY'
+  if [ -z "${GLASSBOX_ATLAS_BOOTSTRAP_API_KEY:-}" ]; then
+    echo "GLASSBOX_ATLAS_BOOTSTRAP_API_KEY is required to enroll the managed proxy" >&2
+    exit 64
+  fi
+  GLASSBOX_PROXY_CONTROL_TOKEN="$(python - "$GLASSBOX_CONTROL_BOOTSTRAP_URL" "$GLASSBOX_ATLAS_BOOTSTRAP_API_KEY" <<'PY'
 import json, sys
 from urllib import request
 url, api_key = sys.argv[1:]
@@ -76,14 +69,11 @@ exec gosu glassbox "$@" \
   -s /opt/glassbox/atlas_addon.py \
   --set "glassbox_atlas_enabled=$GLASSBOX_ATLAS_ENABLED" \
   --set "glassbox_atlas_endpoint=${GLASSBOX_ATLAS_ENDPOINT:-}" \
-  --set "glassbox_atlas_api_key_env=$GLASSBOX_ATLAS_API_KEY_ENV" \
   --set "glassbox_atlas_timeout_seconds=$GLASSBOX_ATLAS_TIMEOUT_SECONDS" \
   --set "glassbox_atlas_inspection_mode=$GLASSBOX_ATLAS_INSPECTION_MODE" \
   --set "glassbox_atlas_fail_mode=$GLASSBOX_ATLAS_FAIL_MODE" \
   --set "glassbox_atlas_source=$GLASSBOX_ATLAS_SOURCE" \
   --set "glassbox_atlas_profile=$GLASSBOX_ATLAS_PROFILE" \
-  --set "glassbox_control_config_url=${GLASSBOX_CONTROL_CONFIG_URL:-}" \
   --set "glassbox_control_token_env=$GLASSBOX_CONTROL_TOKEN_ENV" \
-  --set "glassbox_control_poll_seconds=$GLASSBOX_CONTROL_POLL_SECONDS" \
   --set "glassbox_control_telemetry_url=${GLASSBOX_CONTROL_TELEMETRY_URL:-}" \
   --set "glassbox_control_telemetry_seconds=$GLASSBOX_CONTROL_TELEMETRY_SECONDS"

@@ -10,8 +10,6 @@ enabled the relevant mitmproxy mode and client trust configuration.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import json
 import os
 import time
@@ -45,26 +43,26 @@ class AtlasDecision(NamedTuple):
 
     action: str
     request_id: str
+    enforcement_mode: str = "enforce"
 
 
 class AtlasInspectionClient(Protocol):
     """Transport boundary that keeps mitmproxy hooks testable and replaceable."""
 
-    async def inspect(self, payload: Mapping[str, Any]) -> AtlasDecision: ...
+    async def inspect(self, payload: Mapping[str, Any], api_key: str) -> AtlasDecision: ...
 
 
 class UrllibAtlasInspectionClient:
     """Small standard-library client with certificate verification left enabled."""
 
-    def __init__(self, *, endpoint: str, api_key: str, timeout_seconds: float) -> None:
+    def __init__(self, *, endpoint: str, timeout_seconds: float) -> None:
         self._endpoint = endpoint
-        self._api_key = api_key
         self._timeout_seconds = timeout_seconds
 
-    async def inspect(self, payload: Mapping[str, Any]) -> AtlasDecision:
-        return await asyncio.to_thread(self._inspect_blocking, payload)
+    async def inspect(self, payload: Mapping[str, Any], api_key: str) -> AtlasDecision:
+        return await asyncio.to_thread(self._inspect_blocking, payload, api_key)
 
-    def _inspect_blocking(self, payload: Mapping[str, Any]) -> AtlasDecision:
+    def _inspect_blocking(self, payload: Mapping[str, Any], api_key: str) -> AtlasDecision:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         api_request = request.Request(
             self._endpoint,
@@ -72,7 +70,7 @@ class UrllibAtlasInspectionClient:
             headers={
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "X-API-Key": self._api_key,
+                "X-API-Key": api_key,
             },
             method="POST",
         )
@@ -90,9 +88,10 @@ class UrllibAtlasInspectionClient:
 
         action = decoded.get("action")
         request_id = decoded.get("id")
-        if not isinstance(action, str) or not isinstance(request_id, str):
+        enforcement_mode = decoded.get("enforcement_mode", "enforce")
+        if not isinstance(action, str) or not isinstance(request_id, str) or enforcement_mode not in {"enforce", "monitor", "bypass"}:
             raise AtlasClientError("Atlas returned an incomplete policy response")
-        return AtlasDecision(action=action, request_id=request_id)
+        return AtlasDecision(action=action, request_id=request_id, enforcement_mode=enforcement_mode)
 
 
 class GlassBoxAtlasAddon:
@@ -100,9 +99,6 @@ class GlassBoxAtlasAddon:
 
     def __init__(self, client: AtlasInspectionClient | None = None) -> None:
         self._client = client
-        self._enforcement_mode = "enforce"
-        self._control_version = 0
-        self._control_checked_at = 0.0
         self._telemetry_checked_at = 0.0
         self._telemetry_task: asyncio.Task[None] | None = None
         self._forwarded = 0
@@ -123,12 +119,6 @@ class GlassBoxAtlasAddon:
             typespec=str,
             default="",
             help="HTTPS Atlas /api/v1/atlas/gateway/inspect endpoint.",
-        )
-        loader.add_option(
-            name="glassbox_atlas_api_key_env",
-            typespec=str,
-            default="GLASSBOX_ATLAS_API_KEY",
-            help="Environment variable containing the Atlas API key; its value is never logged.",
         )
         loader.add_option(
             name="glassbox_atlas_timeout_seconds",
@@ -163,9 +153,7 @@ class GlassBoxAtlasAddon:
             default="metadata_only",
             help="HTTPS enforcement mode: metadata_only or tls_inspection.",
         )
-        loader.add_option(name="glassbox_control_config_url", typespec=str, default="", help="Atlas signed proxy-control configuration endpoint.")
         loader.add_option(name="glassbox_control_token_env", typespec=str, default="GLASSBOX_PROXY_CONTROL_TOKEN", help="Environment variable containing the per-proxy control token.")
-        loader.add_option(name="glassbox_control_poll_seconds", typespec=str, default="5", help="Signed control configuration polling interval in seconds.")
         loader.add_option(name="glassbox_control_telemetry_url", typespec=str, default="", help="Atlas authenticated proxy telemetry endpoint.")
         loader.add_option(name="glassbox_control_telemetry_seconds", typespec=str, default="5", help="Minimum telemetry publish interval in seconds.")
 
@@ -235,14 +223,14 @@ class GlassBoxAtlasAddon:
 
     async def _enforce(self, flow: http.HTTPFlow, payload: Mapping[str, Any]) -> None:
         started_at = time.monotonic()
-        await self._refresh_control_mode()
-        if self._enforcement_mode == "bypass":
-            flow.metadata["glassbox_atlas_mode"] = "bypass"
-            self._record_telemetry("forwarded", started_at)
+        api_key = self._take_integration_api_key(flow)
+        if not api_key:
+            self._block(flow, request_id=str(uuid.uuid4()), service_unavailable=False, missing_api_key=True)
+            self._record_telemetry("blocked", started_at)
             return
         local_request_id = str(uuid.uuid4())
         try:
-            decision = await self._inspection_client().inspect(payload)
+            decision = await self._inspection_client().inspect(payload, api_key)
         # The enforcement point must not leak an unexpected client/transport
         # exception into the proxy runtime. The configured fail mode owns every
         # inability to obtain a decision, including future transport adapters.
@@ -255,26 +243,29 @@ class GlassBoxAtlasAddon:
                 self._record_telemetry("forwarded", started_at)
             return
 
-        if decision.action in _BLOCKING_ACTIONS and self._enforcement_mode == "enforce":
+        if decision.enforcement_mode == "bypass":
+            flow.metadata["glassbox_atlas_mode"] = "bypass"
+            self._record_telemetry("forwarded", started_at)
+        elif decision.action in _BLOCKING_ACTIONS and decision.enforcement_mode == "enforce":
             self._block(flow, request_id=decision.request_id, service_unavailable=False)
             self._record_telemetry("blocked", started_at)
         elif decision.action in _BLOCKING_ACTIONS:
             flow.metadata["glassbox_atlas_would_block"] = True
-            self._record_telemetry("would_block", started_at)
-            self._record_telemetry("forwarded", started_at)
+            self._record_telemetry(("would_block", "forwarded"), started_at)
         else:
             self._record_telemetry("forwarded", started_at)
 
-    def _record_telemetry(self, outcome: str, started_at: float) -> None:
+    def _record_telemetry(self, outcomes: str | tuple[str, ...], started_at: float) -> None:
         """Record real enforcement outcomes without retaining request content."""
-        if outcome == "forwarded":
-            self._forwarded += 1
-        elif outcome == "blocked":
-            self._blocked += 1
-        elif outcome == "would_block":
-            self._would_block += 1
-        elif outcome == "policy_error":
-            self._policy_errors += 1
+        for outcome in (outcomes,) if isinstance(outcomes, str) else outcomes:
+            if outcome == "forwarded":
+                self._forwarded += 1
+            elif outcome == "blocked":
+                self._blocked += 1
+            elif outcome == "would_block":
+                self._would_block += 1
+            elif outcome == "policy_error":
+                self._policy_errors += 1
         self._latencies_ms.append((time.monotonic() - started_at) * 1_000)
         self._schedule_telemetry_publish()
 
@@ -309,8 +300,8 @@ class GlassBoxAtlasAddon:
         # slowest sample rather than the third sample.
         p95 = samples[max(0, (len(samples) * 95 + 99) // 100 - 1)] if samples else None
         return {
-            "version": self._control_version,
-            "mode": self._enforcement_mode,
+            "version": 0,
+            "mode": "per_key",
             "forwarded": self._forwarded,
             "blocked": self._blocked,
             "would_block": self._would_block,
@@ -334,39 +325,6 @@ class GlassBoxAtlasAddon:
             if response.status != 204:
                 raise AtlasClientError(f"Atlas telemetry returned HTTP {response.status}")
 
-    async def _refresh_control_mode(self) -> None:
-        """Accept only an HMAC-authenticated, monotonically-versioned Atlas mode."""
-        url = ctx.options.glassbox_control_config_url
-        if not url or time.monotonic() - self._control_checked_at < float(ctx.options.glassbox_control_poll_seconds):
-            return
-        self._control_checked_at = time.monotonic()
-        token = os.getenv(ctx.options.glassbox_control_token_env)
-        if not token:
-            return
-        try:
-            envelope = await asyncio.to_thread(self._fetch_control_config, url, token)
-            config = envelope["config"]
-            canonical = json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
-            expected = hmac.new(token.encode(), canonical, hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(expected, envelope["signature"]):
-                raise AtlasClientError("Atlas control signature did not verify")
-            mode = config.get("mode")
-            version = config.get("version")
-            if mode not in {"enforce", "monitor", "bypass"} or not isinstance(version, int):
-                raise AtlasClientError("Atlas control configuration is invalid")
-            if version >= self._control_version:
-                self._enforcement_mode, self._control_version = mode, version
-        except Exception:
-            # Retain the last verified mode. A control-plane outage must never
-            # turn an enforcing proxy into bypass mode.
-            return
-
-    @staticmethod
-    def _fetch_control_config(url: str, token: str) -> dict[str, Any]:
-        control_request = request.Request(url, headers={"Accept": "application/json", "X-GlassBox-Proxy-Token": token})
-        with request.urlopen(control_request, timeout=2.0) as response:
-            return json.loads(response.read().decode("utf-8"))
-
     @staticmethod
     def _connect_payload(flow: http.HTTPFlow) -> dict[str, Any]:
         host = flow.request.host
@@ -386,14 +344,30 @@ class GlassBoxAtlasAddon:
     def _inspection_client(self) -> AtlasInspectionClient:
         if self._client is not None:
             return self._client
-        api_key = os.getenv(ctx.options.glassbox_atlas_api_key_env)
-        if not api_key:
-            raise AtlasClientError("Atlas API key is unavailable")
         return UrllibAtlasInspectionClient(
             endpoint=ctx.options.glassbox_atlas_endpoint,
-            api_key=api_key,
             timeout_seconds=float(ctx.options.glassbox_atlas_timeout_seconds),
         )
+
+    @staticmethod
+    def _take_integration_api_key(flow: http.HTTPFlow) -> str | None:
+        """Read and remove the integration credential before upstream forwarding.
+
+        ``Proxy-Authorization: Bearer <key>`` works for standard explicit
+        proxy clients. ``X-GlassBox-API-Key`` is convenient for SDK clients.
+        Neither header ever reaches the external destination or Atlas logs.
+        """
+        supplied = flow.request.headers.get("Proxy-Authorization")
+        if supplied:
+            del flow.request.headers["Proxy-Authorization"]
+            scheme, _, value = supplied.partition(" ")
+            if scheme.lower() == "bearer" and value.strip():
+                return value.strip()
+        supplied = flow.request.headers.get("X-GlassBox-API-Key")
+        if supplied:
+            del flow.request.headers["X-GlassBox-API-Key"]
+            return supplied.strip() or None
+        return None
 
     @staticmethod
     def _payload(flow: http.HTTPFlow) -> dict[str, Any]:
@@ -414,10 +388,12 @@ class GlassBoxAtlasAddon:
 
     @staticmethod
     def _block(
-        flow: http.HTTPFlow, *, request_id: str, service_unavailable: bool
+        flow: http.HTTPFlow, *, request_id: str, service_unavailable: bool, missing_api_key: bool = False
     ) -> None:
         message = (
-            "Blocked by GlassBox Atlas: policy service unavailable."
+            "Blocked by GlassBox Atlas: an integration API key is required."
+            if missing_api_key
+            else "Blocked by GlassBox Atlas: policy service unavailable."
             if service_unavailable
             else "Blocked by GlassBox Atlas: egress policy denied this request."
         )
@@ -425,7 +401,7 @@ class GlassBoxAtlasAddon:
             "utf-8"
         )
         flow.response = http.Response.make(
-            503 if service_unavailable else 403,
+            401 if missing_api_key else 503 if service_unavailable else 403,
             body,
             {
                 "Content-Type": "application/json; charset=utf-8",
