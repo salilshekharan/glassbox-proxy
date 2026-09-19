@@ -40,6 +40,7 @@ ENV HOME=/var/lib/glassbox-proxy \
     GLASSBOX_ATLAS_ENABLED=true \
     GLASSBOX_ATLAS_FAIL_MODE=closed \
     GLASSBOX_ATLAS_TIMEOUT_SECONDS=0.5 \
+    GLASSBOX_ATLAS_INSPECTION_MODE=metadata_only \
     GLASSBOX_ATLAS_PROFILE=quick \
     GLASSBOX_ATLAS_SOURCE=glassbox-proxy
 
