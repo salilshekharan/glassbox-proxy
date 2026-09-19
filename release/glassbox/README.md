@@ -16,9 +16,10 @@ docker run --rm -p 8080:8080 \
   glassbox-proxy:dev
 ```
 
-The container starts fail-closed by default and exits before binding if its
-endpoint or API-key environment variable is absent. Mount
-`/var/lib/glassbox-proxy` to retain the generated CA only when TLS inspection
-is explicitly enabled in a later deployment phase. The image is not yet an
+The container starts fail-closed in `metadata_only` mode by default: HTTPS is
+checked at `CONNECT`, then passed through without TLS decryption or client CA
+trust. Plain HTTP is checked from its normal proxy request metadata. Mount
+`/var/lib/glassbox-proxy` only when TLS inspection is explicitly enabled in a
+later deployment phase. The image is not yet an
 enterprise release: SBOM, image signing, HA, performance, recovery, and
 security gates remain required by `GLASSBOX.md`.

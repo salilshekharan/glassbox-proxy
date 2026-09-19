@@ -29,7 +29,12 @@ async def test_allows_when_atlas_allows() -> None:
     client = StubClient(AtlasDecision(action="allow", request_id="atlas-allow"))
     addon = GlassBoxAtlasAddon(client)
     with taddons.context(addon) as tctx:
-        tctx.configure(addon, glassbox_atlas_enabled=True, glassbox_atlas_endpoint="https://atlas.test/inspect")
+        tctx.configure(
+            addon,
+            glassbox_atlas_enabled=True,
+            glassbox_atlas_endpoint="https://atlas.test/inspect",
+            glassbox_atlas_inspection_mode="tls_inspection",
+        )
         flow = tflow.tflow()
         flow.request.url = "https://agent.example/download?token=not-forwarded"
         flow.request.headers["Authorization"] = "Bearer not-forwarded"
@@ -46,9 +51,16 @@ async def test_allows_when_atlas_allows() -> None:
 
 @pytest.mark.asyncio
 async def test_blocks_with_atlas_correlation_id() -> None:
-    addon = GlassBoxAtlasAddon(StubClient(AtlasDecision(action="block", request_id="atlas-block-42")))
+    addon = GlassBoxAtlasAddon(
+        StubClient(AtlasDecision(action="block", request_id="atlas-block-42"))
+    )
     with taddons.context(addon) as tctx:
-        tctx.configure(addon, glassbox_atlas_enabled=True, glassbox_atlas_endpoint="https://atlas.test/inspect")
+        tctx.configure(
+            addon,
+            glassbox_atlas_enabled=True,
+            glassbox_atlas_endpoint="https://atlas.test/inspect",
+            glassbox_atlas_inspection_mode="tls_inspection",
+        )
         flow = tflow.tflow()
 
         await addon.request(flow)
@@ -63,7 +75,12 @@ async def test_blocks_with_atlas_correlation_id() -> None:
 async def test_fails_closed_when_atlas_is_unavailable() -> None:
     addon = GlassBoxAtlasAddon(StubClient(RuntimeError("unavailable")))
     with taddons.context(addon) as tctx:
-        tctx.configure(addon, glassbox_atlas_enabled=True, glassbox_atlas_endpoint="https://atlas.test/inspect")
+        tctx.configure(
+            addon,
+            glassbox_atlas_enabled=True,
+            glassbox_atlas_endpoint="https://atlas.test/inspect",
+            glassbox_atlas_inspection_mode="tls_inspection",
+        )
         flow = tflow.tflow()
 
         await addon.request(flow)
@@ -81,9 +98,52 @@ async def test_fails_open_when_configured() -> None:
             glassbox_atlas_enabled=True,
             glassbox_atlas_endpoint="https://atlas.test/inspect",
             glassbox_atlas_fail_mode="open",
+            glassbox_atlas_inspection_mode="tls_inspection",
         )
         flow = tflow.tflow()
 
         await addon.request(flow)
 
     assert flow.response is None
+
+
+@pytest.mark.asyncio
+async def test_metadata_only_blocks_https_at_connect_without_a_path() -> None:
+    addon = GlassBoxAtlasAddon(
+        StubClient(AtlasDecision(action="block", request_id="connect-block"))
+    )
+    with taddons.context(addon) as tctx:
+        tctx.configure(
+            addon,
+            glassbox_atlas_enabled=True,
+            glassbox_atlas_endpoint="https://atlas.test/inspect",
+        )
+        flow = tflow.tflow()
+        flow.request.method = "CONNECT"
+        flow.request.host = "agent.example"
+        flow.request.port = 443
+        flow.request.path = "agent.example:443"
+
+        await addon.http_connect(flow)
+
+    assert flow.response.status_code == 403
+    assert addon._client.payload["destination"] == "https://agent.example/"  # type: ignore[union-attr]
+    assert addon._client.payload["method"] == "CONNECT"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_metadata_only_does_not_inspect_decrypted_https_request() -> None:
+    client = StubClient(AtlasDecision(action="allow", request_id="unused"))
+    addon = GlassBoxAtlasAddon(client)
+    with taddons.context(addon) as tctx:
+        tctx.configure(
+            addon,
+            glassbox_atlas_enabled=True,
+            glassbox_atlas_endpoint="https://atlas.test/inspect",
+        )
+        flow = tflow.tflow()
+        flow.request.url = "https://agent.example/private/path?credential=not-inspected"
+
+        await addon.request(flow)
+
+    assert client.payload is None

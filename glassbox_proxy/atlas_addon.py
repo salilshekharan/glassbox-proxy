@@ -26,7 +26,9 @@ from mitmproxy import ctx
 from mitmproxy import http
 from mitmproxy.exceptions import OptionsError
 
-_SAFE_REQUEST_HEADERS = frozenset({"accept", "content-length", "content-type", "user-agent"})
+_SAFE_REQUEST_HEADERS = frozenset(
+    {"accept", "content-length", "content-type", "user-agent"}
+)
 _BLOCKING_ACTIONS = frozenset({"block", "require_review"})
 
 
@@ -72,7 +74,9 @@ class UrllibAtlasInspectionClient:
             method="POST",
         )
         try:
-            with request.urlopen(api_request, timeout=self._timeout_seconds) as response:
+            with request.urlopen(
+                api_request, timeout=self._timeout_seconds
+            ) as response:
                 if response.status != 200:
                     raise AtlasClientError(f"Atlas returned HTTP {response.status}")
                 decoded = json.loads(response.read().decode("utf-8"))
@@ -137,24 +141,75 @@ class GlassBoxAtlasAddon:
             default="quick",
             help="Atlas policy profile for metadata-only proxy enforcement.",
         )
+        loader.add_option(
+            name="glassbox_atlas_inspection_mode",
+            typespec=str,
+            default="metadata_only",
+            help="HTTPS enforcement mode: metadata_only or tls_inspection.",
+        )
 
     def configure(self, updates: set[str]) -> None:
-        if not {"glassbox_atlas_enabled", "glassbox_atlas_endpoint", "glassbox_atlas_timeout_seconds", "glassbox_atlas_fail_mode"}.intersection(updates):
+        if not {
+            "glassbox_atlas_enabled",
+            "glassbox_atlas_endpoint",
+            "glassbox_atlas_timeout_seconds",
+            "glassbox_atlas_fail_mode",
+            "glassbox_atlas_inspection_mode",
+        }.intersection(updates):
             return
-        if ctx.options.glassbox_atlas_enabled and not ctx.options.glassbox_atlas_endpoint:
-            raise OptionsError("glassbox_atlas_endpoint is required when GlassBox Atlas is enabled")
+        if (
+            ctx.options.glassbox_atlas_enabled
+            and not ctx.options.glassbox_atlas_endpoint
+        ):
+            raise OptionsError(
+                "glassbox_atlas_endpoint is required when GlassBox Atlas is enabled"
+            )
         if ctx.options.glassbox_atlas_timeout_seconds <= 0:
-            raise OptionsError("glassbox_atlas_timeout_seconds must be greater than zero")
+            raise OptionsError(
+                "glassbox_atlas_timeout_seconds must be greater than zero"
+            )
         if ctx.options.glassbox_atlas_fail_mode not in {"closed", "open"}:
             raise OptionsError("glassbox_atlas_fail_mode must be closed or open")
+        if ctx.options.glassbox_atlas_inspection_mode not in {
+            "metadata_only",
+            "tls_inspection",
+        }:
+            raise OptionsError(
+                "glassbox_atlas_inspection_mode must be metadata_only or tls_inspection"
+            )
+
+    async def http_connect(self, flow: http.HTTPFlow) -> None:
+        """Check an HTTPS tunnel before a client TLS session is established.
+
+        ``metadata_only`` is the managed-image default. It provides hostname,
+        port, method and source to Atlas, but neither requires client CA trust
+        nor exposes the encrypted request path, headers, or body to the proxy.
+        """
+        if (
+            not ctx.options.glassbox_atlas_enabled
+            or ctx.options.glassbox_atlas_inspection_mode != "metadata_only"
+            or flow.response is not None
+        ):
+            return
+        await self._enforce(flow, self._connect_payload(flow))
 
     async def request(self, flow: http.HTTPFlow) -> None:
         if not ctx.options.glassbox_atlas_enabled or flow.response is not None:
             return
+        # HTTPS is handled at CONNECT in metadata-only mode. The managed image
+        # also configures mitmproxy passthrough for that mode, so this hook
+        # never receives decrypted application traffic.
+        if (
+            flow.request.scheme == "https"
+            and ctx.options.glassbox_atlas_inspection_mode == "metadata_only"
+        ):
+            return
+        await self._enforce(flow, self._payload(flow))
 
+    async def _enforce(self, flow: http.HTTPFlow, payload: Mapping[str, Any]) -> None:
         local_request_id = str(uuid.uuid4())
         try:
-            decision = await self._inspection_client().inspect(self._payload(flow))
+            decision = await self._inspection_client().inspect(payload)
         # The enforcement point must not leak an unexpected client/transport
         # exception into the proxy runtime. The configured fail mode owns every
         # inability to obtain a decision, including future transport adapters.
@@ -165,6 +220,22 @@ class GlassBoxAtlasAddon:
 
         if decision.action in _BLOCKING_ACTIONS:
             self._block(flow, request_id=decision.request_id, service_unavailable=False)
+
+    @staticmethod
+    def _connect_payload(flow: http.HTTPFlow) -> dict[str, Any]:
+        host = flow.request.host
+        port = flow.request.port or 443
+        authority = host if port == 443 else f"{host}:{port}"
+        return {
+            "protocol": "https",
+            "direction": "outbound",
+            "source": ctx.options.glassbox_atlas_source,
+            "destination": f"https://{authority}/",
+            "method": "CONNECT",
+            "headers": {},
+            "profile": ctx.options.glassbox_atlas_profile,
+            "tags": ["glassbox_proxy", "metadata_only", "connect"],
+        }
 
     def _inspection_client(self) -> AtlasInspectionClient:
         if self._client is not None:
@@ -196,13 +267,17 @@ class GlassBoxAtlasAddon:
         }
 
     @staticmethod
-    def _block(flow: http.HTTPFlow, *, request_id: str, service_unavailable: bool) -> None:
+    def _block(
+        flow: http.HTTPFlow, *, request_id: str, service_unavailable: bool
+    ) -> None:
         message = (
             "Blocked by GlassBox Atlas: policy service unavailable."
             if service_unavailable
             else "Blocked by GlassBox Atlas: egress policy denied this request."
         )
-        body = json.dumps({"message": message, "request_id": request_id}).encode("utf-8")
+        body = json.dumps({"message": message, "request_id": request_id}).encode(
+            "utf-8"
+        )
         flow.response = http.Response.make(
             503 if service_unavailable else 403,
             body,
