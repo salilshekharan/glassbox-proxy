@@ -10,8 +10,11 @@ enabled the relevant mitmproxy mode and client trust configuration.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
+import time
 import uuid
 from collections.abc import Mapping
 from typing import Any
@@ -96,6 +99,9 @@ class GlassBoxAtlasAddon:
 
     def __init__(self, client: AtlasInspectionClient | None = None) -> None:
         self._client = client
+        self._enforcement_mode = "enforce"
+        self._control_version = 0
+        self._control_checked_at = 0.0
 
     def load(self, loader: Any) -> None:
         loader.add_option(
@@ -149,6 +155,9 @@ class GlassBoxAtlasAddon:
             default="metadata_only",
             help="HTTPS enforcement mode: metadata_only or tls_inspection.",
         )
+        loader.add_option(name="glassbox_control_config_url", typespec=str, default="", help="Atlas signed proxy-control configuration endpoint.")
+        loader.add_option(name="glassbox_control_token_env", typespec=str, default="GLASSBOX_PROXY_CONTROL_TOKEN", help="Environment variable containing the per-proxy control token.")
+        loader.add_option(name="glassbox_control_poll_seconds", typespec=str, default="5", help="Signed control configuration polling interval in seconds.")
 
     def configure(self, updates: set[str]) -> None:
         if not {
@@ -215,6 +224,10 @@ class GlassBoxAtlasAddon:
         await self._enforce(flow, self._payload(flow))
 
     async def _enforce(self, flow: http.HTTPFlow, payload: Mapping[str, Any]) -> None:
+        await self._refresh_control_mode()
+        if self._enforcement_mode == "bypass":
+            flow.metadata["glassbox_atlas_mode"] = "bypass"
+            return
         local_request_id = str(uuid.uuid4())
         try:
             decision = await self._inspection_client().inspect(payload)
@@ -226,8 +239,43 @@ class GlassBoxAtlasAddon:
                 self._block(flow, request_id=local_request_id, service_unavailable=True)
             return
 
-        if decision.action in _BLOCKING_ACTIONS:
+        if decision.action in _BLOCKING_ACTIONS and self._enforcement_mode == "enforce":
             self._block(flow, request_id=decision.request_id, service_unavailable=False)
+        elif decision.action in _BLOCKING_ACTIONS:
+            flow.metadata["glassbox_atlas_would_block"] = True
+
+    async def _refresh_control_mode(self) -> None:
+        """Accept only an HMAC-authenticated, monotonically-versioned Atlas mode."""
+        url = ctx.options.glassbox_control_config_url
+        if not url or time.monotonic() - self._control_checked_at < float(ctx.options.glassbox_control_poll_seconds):
+            return
+        self._control_checked_at = time.monotonic()
+        token = os.getenv(ctx.options.glassbox_control_token_env)
+        if not token:
+            return
+        try:
+            envelope = await asyncio.to_thread(self._fetch_control_config, url, token)
+            config = envelope["config"]
+            canonical = json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
+            expected = hmac.new(token.encode(), canonical, hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(expected, envelope["signature"]):
+                raise AtlasClientError("Atlas control signature did not verify")
+            mode = config.get("mode")
+            version = config.get("version")
+            if mode not in {"enforce", "monitor", "bypass"} or not isinstance(version, int):
+                raise AtlasClientError("Atlas control configuration is invalid")
+            if version >= self._control_version:
+                self._enforcement_mode, self._control_version = mode, version
+        except Exception:
+            # Retain the last verified mode. A control-plane outage must never
+            # turn an enforcing proxy into bypass mode.
+            return
+
+    @staticmethod
+    def _fetch_control_config(url: str, token: str) -> dict[str, Any]:
+        control_request = request.Request(url, headers={"Accept": "application/json", "X-GlassBox-Proxy-Token": token})
+        with request.urlopen(control_request, timeout=2.0) as response:
+            return json.loads(response.read().decode("utf-8"))
 
     @staticmethod
     def _connect_payload(flow: http.HTTPFlow) -> dict[str, Any]:
