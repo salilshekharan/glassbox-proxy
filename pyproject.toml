@@ -114,7 +114,9 @@ build-backend = "setuptools.build_meta"
 version = {attr = "mitmproxy.version.VERSION"}
 
 [tool.setuptools.packages.find]
-include = ["mitmproxy*"]
+# The GlassBox add-on is part of this pinned distribution, while retaining the
+# upstream mitmproxy package and all of its MIT licence/provenance notices.
+include = ["mitmproxy*", "glassbox_proxy*"]
 
 [tool.coverage.run]
 branch = false
