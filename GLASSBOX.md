@@ -46,3 +46,11 @@ resilience as a security-vulnerability commitment. GlassBox Proxy must prove
 its own concurrency, backpressure, high-availability, observability, and
 incident-response requirements before it can be offered as the enterprise
 default.
+
+## Open release blocker
+
+The current fork source reports `mitmproxy 13.0.0.dev0` when packaged, which
+does not match the recorded v12.2.3 source pin above. Do not publish a
+GlassBox Proxy release until the branch is reset to an independently verified
+upstream commit or this provenance record is intentionally revised through the
+release approval process.

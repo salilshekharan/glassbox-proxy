@@ -14,8 +14,8 @@ import json
 import os
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import Any
+from typing import NamedTuple
 from typing import Protocol
 from urllib import error
 from urllib import request
@@ -36,8 +36,7 @@ class AtlasClientError(RuntimeError):
     """Atlas cannot provide a valid policy decision for this request."""
 
 
-@dataclass(frozen=True)
-class AtlasDecision:
+class AtlasDecision(NamedTuple):
     """The subset of an Atlas decision needed at the proxy enforcement point."""
 
     action: str
@@ -119,8 +118,11 @@ class GlassBoxAtlasAddon:
         )
         loader.add_option(
             name="glassbox_atlas_timeout_seconds",
-            typespec=float,
-            default=0.5,
+            # mitmproxy's script option parser supports scalar strings across
+            # both the v12 pin and current development sources. Convert at the
+            # boundary below instead of depending on its float parser.
+            typespec=str,
+            default="0.5",
             help="Bounded Atlas policy-decision timeout in seconds.",
         )
         loader.add_option(
@@ -164,7 +166,13 @@ class GlassBoxAtlasAddon:
             raise OptionsError(
                 "glassbox_atlas_endpoint is required when GlassBox Atlas is enabled"
             )
-        if ctx.options.glassbox_atlas_timeout_seconds <= 0:
+        try:
+            timeout_seconds = float(ctx.options.glassbox_atlas_timeout_seconds)
+        except (TypeError, ValueError) as exc:
+            raise OptionsError(
+                "glassbox_atlas_timeout_seconds must be a number"
+            ) from exc
+        if timeout_seconds <= 0:
             raise OptionsError(
                 "glassbox_atlas_timeout_seconds must be greater than zero"
             )
@@ -246,7 +254,7 @@ class GlassBoxAtlasAddon:
         return UrllibAtlasInspectionClient(
             endpoint=ctx.options.glassbox_atlas_endpoint,
             api_key=api_key,
-            timeout_seconds=ctx.options.glassbox_atlas_timeout_seconds,
+            timeout_seconds=float(ctx.options.glassbox_atlas_timeout_seconds),
         )
 
     @staticmethod
