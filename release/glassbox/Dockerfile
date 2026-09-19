@@ -31,7 +31,9 @@ RUN pip install --no-index --find-links=/wheels mitmproxy \
 
 COPY glassbox_proxy/atlas_addon.py /opt/glassbox/atlas_addon.py
 COPY release/glassbox/docker-entrypoint.sh /usr/local/bin/glassbox-entrypoint
-RUN chmod 0555 /usr/local/bin/glassbox-entrypoint \
+# Keep the image runnable when the source tree was checked out on Windows.
+RUN sed -i 's/\r$//' /usr/local/bin/glassbox-entrypoint \
+    && chmod 0555 /usr/local/bin/glassbox-entrypoint \
     && chown -R glassbox:glassbox /opt/glassbox /var/lib/glassbox-proxy
 
 ENV HOME=/var/lib/glassbox-proxy \

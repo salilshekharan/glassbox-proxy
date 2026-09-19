@@ -2,3 +2,7 @@ mitmproxy/tools/web/static/**/* -diff linguist-vendored
 web/src/js/filt/filt.js -diff
 *.bin binary
 *.mitm binary
+
+# The managed-image entrypoint is executed directly by Linux. Preserve its
+# shebang and shell syntax even when the fork is checked out on Windows.
+release/glassbox/docker-entrypoint.sh text eol=lf
